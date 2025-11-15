@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Li-Fi Text Transmitter</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        /* Custom CSS for a better mobile-first experience */
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f9fb;
+        }
+        .container-card {
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 5px 10px -5px rgba(0, 0, 0, 0.04);
+            transition: all 0.3s ease;
+        }
+        .flash-active {
+            filter: drop-shadow(0 0 10px #fcd34d) drop-shadow(0 0 20px #fcd34d);
+        }
+    </style>
+</head>
+<body class="p-4 flex items-center justify-center min-h-screen">
+
+    <div id="app" class="w-full max-w-lg container-card bg-white p-6 md:p-8 rounded-xl">
+        <h1 class="text-3xl font-bold text-gray-800 mb-2">Li-Fi Text Sender</h1>
+        <p class="text-gray-500 mb-6">Transmit text data by rapidly flashing your device's flashlight.</p>
+
+        <!-- Status & Warning Area -->
+        <div id="status-message" class="p-3 mb-4 rounded-lg text-sm transition duration-300 bg-blue-100 text-blue-700">
+            Awaiting initialization and camera access...
+        </div>
+
+        <!-- Input Section -->
+        <div class="space-y-4">
+            <textarea id="dataInput" rows="3" placeholder="Enter text to transmit (e.g., 'Hello LiFi')"
+                      class="w-full p-3 border border-gray-300 rounded-lg focus:ring-amber-500 focus:border-amber-500 text-gray-700 resize-none"></textarea>
+
+            <label class="block text-sm font-medium text-gray-700">
+                Bit Delay (ms, MUST match Arduino's **100ms** for best results):
+            </label>
+            <input type="number" id="delayInput" value="100" min="50" max="1000"
+                   class="w-full p-3 border border-gray-300 rounded-lg focus:ring-amber-500 focus:border-amber-500 text-gray-700">
+
+            <button id="sendButton" onclick="sendData()"
+                    class="w-full py-3 px-4 bg-amber-500 hover:bg-amber-600 text-white font-semibold rounded-lg shadow-md transition duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                    disabled>
+                Start Flashing
+            </button>
+        </div>
+
+        <!-- Visual Flash Indicator -->
+        <div class="mt-8 flex justify-center">
+            <div id="flashIndicator" class="w-16 h-16 bg-gray-200 rounded-full border-4 border-gray-400"></div>
+        </div>
+        <p id="transmissionLog" class="text-center text-sm text-gray-500 mt-4 h-5"></p>
+
+        <!-- Device Compatibility Warning -->
+        <div class="mt-8 p-4 bg-red-50 text-red-700 text-xs rounded-lg border border-red-200">
+            <strong>Compatibility Warning:</strong> This feature requires a secure context (HTTPS) and a mobile browser that supports the 'torch' camera constraint. You must grant camera access (video input) for the flashlight control to function.
+        </div>
+    </div>
+
+    <script>
+        // Global variables for camera control
+        let videoStream = null;
+        let videoTrack = null;
+        let isTransmitting = false;
+
+        const statusMessage = document.getElementById('status-message');
+        const sendButton = document.getElementById('sendButton');
+        const flashIndicator = document.getElementById('flashIndicator');
+        const transmissionLog = document.getElementById('transmissionLog');
+
+        /**
+         * Utility function to pause execution for a given time.
+         * @param {number} ms - Milliseconds to wait.
+         */
+        const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+        /**
+         * Initializes camera access and attempts to get the torch-capable track.
+         */
+        async function initCameraAndTorch() {
+            try {
+                statusMessage.textContent = "Requesting camera permission...";
+                statusMessage.className = "p-3 mb-4 rounded-lg text-sm transition duration-300 bg-yellow-100 text-yellow-700";
+
+                // Request camera access, specifically the environment-facing one (usually where the flash is)
+                videoStream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: 'environment'
+                    }
+                });
+
+                videoTrack = videoStream.getVideoTracks()[0];
+                const capabilities = videoTrack.getCapabilities();
+
+                if (capabilities.torch) {
+                    // Torch control is supported
+                    statusMessage.textContent = "Torch feature detected! Ready to transmit.";
+                    statusMessage.className = "p-3 mb-4 rounded-lg text-sm transition duration-300 bg-green-100 text-green-700";
+                    sendButton.disabled = false;
+                } else {
+                    statusMessage.textContent = "Error: Torch control not supported on this device/browser, or camera access was denied.";
+                    statusMessage.className = "p-3 mb-4 rounded-lg text-sm transition duration-300 bg-red-100 text-red-700";
+                    // Stop the stream if torch is not supported but we got the camera
+                    videoTrack.stop();
+                    videoStream = null;
+                }
+            } catch (err) {
+                console.error("Camera access error:", err);
+                statusMessage.textContent = "Error accessing camera/flashlight. Please ensure HTTPS and permissions are granted. (" + err.name + ")";
+                statusMessage.className = "p-3 mb-4 rounded-lg text-sm transition duration-300 bg-red-100 text-red-700";
+            }
+        }
+
+        /**
+         * Converts an ASCII string to a complete binary string.
+         * @param {string} text
+         * @returns {string[]} An array of 8-bit binary strings for each character.
+         */
+        function textToBinary(text) {
+            let binaryChars = [];
+            for (let i = 0; i < text.length; i++) {
+                const charCode = text.charCodeAt(i);
+                // Convert to 8-bit binary, padded with leading zeros
+                const binaryChar = charCode.toString(2).padStart(8, '0');
+                binaryChars.push(binaryChar);
+            }
+            return binaryChars;
+        }
+
+        /**
+         * Controls the torch/visual indicator based on the bit value.
+         * @param {string} bit - '0' or '1'.
+         * @param {number} delay - Duration of the flash state.
+         */
+        async function flashBit(bit, delay) {
+            const isOne = bit === '1';
+
+            if (isOne) {
+                // Turn ON (representing '1')
+                await videoTrack.applyConstraints({ advanced: [{ torch: true }] });
+                flashIndicator.className = "w-16 h-16 bg-yellow-400 rounded-full border-4 border-yellow-500 flash-active";
+            } else {
+                // Turn OFF (representing '0' - using a brief period of darkness)
+                await videoTrack.applyConstraints({ advanced: [{ torch: false }] });
+                flashIndicator.className = "w-16 h-16 bg-gray-600 rounded-full border-4 border-gray-400";
+            }
+
+            transmissionLog.textContent = `Sending bit: ${bit}`;
+            await sleep(delay); // Hold the state for the delay duration
+        }
+
+        /**
+         * Main function to start the data transmission.
+         */
+        async function sendData() {
+            if (!videoTrack || isTransmitting) return;
+
+            const text = document.getElementById('dataInput').value.trim();
+            const delay = parseInt(document.getElementById('delayInput').value, 10);
+
+            if (!text) {
+                console.warn("Please enter some text to transmit.");
+                // Using custom modal here since alert() is disallowed
+                alertModal("Please enter some text to transmit.");
+                return;
+            }
+            
+            if (delay < 50) {
+                console.warn("Delay too low. Using 50ms minimum.");
+                // Using custom modal here since alert() is disallowed
+                alertModal("Minimum delay is 50ms. Using 50ms.");
+                document.getElementById('delayInput').value = 50;
+                return;
+            }
+
+            // 1. Setup
+            isTransmitting = true;
+            sendButton.disabled = true;
+            sendButton.textContent = "Transmitting...";
+            statusMessage.textContent = `Starting transmission of ${text.length} characters (Delay: ${delay}ms)...`;
+            statusMessage.className = "p-3 mb-4 rounded-lg text-sm transition duration-300 bg-blue-100 text-blue-700";
+
+            try {
+                // 2. Convert text to an array of 8-bit binary strings
+                const binaryChars = textToBinary(text);
+                
+                // 3. Transmit the data bits using the serial communication protocol
+                for (let i = 0; i < binaryChars.length; i++) {
+                    const charBinary = binaryChars[i];
+                    
+                    // --- Protocol: Start Bit (LOW/0) ---
+                    // This synchronizes the Arduino.
+                    await flashBit('0', delay); 
+                    
+                    transmissionLog.textContent = `Sending char ${i+1}/${binaryChars.length}: ${charBinary}`;
+
+                    // Transmit 8 Data Bits (MSB first)
+                    for (let j = 0; j < 8; j++) {
+                        const bit = charBinary[j];
+                        await flashBit(bit, delay);
+                    }
+
+                    // --- Protocol: Stop Bit (HIGH/1) ---
+                    // This signals the end of the character transmission.
+                    await flashBit('1', delay); 
+                }
+
+                // 4. Final Cleanup
+                // Send a long LOW to signal end of message and ensure the light is off.
+                statusMessage.textContent = "Transmission complete, ensuring torch is OFF...";
+                await flashBit('0', delay * 3); 
+
+                statusMessage.textContent = "Transmission complete!";
+                statusMessage.className = "p-3 mb-4 rounded-lg text-sm transition duration-300 bg-green-100 text-green-700";
+
+            } catch (error) {
+                console.error("Transmission error:", error);
+                statusMessage.textContent = `An error occurred during transmission: ${error.message}`;
+                statusMessage.className = "p-3 mb-4 rounded-lg text-sm transition duration-300 bg-red-100 text-red-700";
+            } finally {
+                // 5. Final Reset
+                await videoTrack.applyConstraints({ advanced: [{ torch: false }] }); // Ensure torch is OFF
+                flashIndicator.className = "w-16 h-16 bg-gray-200 rounded-full border-4 border-gray-400";
+                transmissionLog.textContent = "";
+
+                isTransmitting = false;
+                sendButton.disabled = false;
+                sendButton.textContent = "Start Flashing";
+            }
+        }
+
+        // --- Custom Alert Modal (Replaces alert()) ---
+
+        function alertModal(message) {
+            const existingModal = document.getElementById('customAlertModal');
+            if (existingModal) existingModal.remove();
+
+            const modalHtml = `
+                <div id="customAlertModal" class="fixed inset-0 z-50 overflow-y-auto bg-gray-600 bg-opacity-75 flex items-center justify-center">
+                    <div class="bg-white p-6 rounded-lg shadow-xl max-w-sm mx-auto">
+                        <h3 class="text-lg font-bold text-gray-900 mb-2">Message</h3>
+                        <p class="text-gray-700 mb-4">${message}</p>
+                        <button onclick="document.getElementById('customAlertModal').remove()"
+                                class="w-full py-2 px-4 bg-amber-500 hover:bg-amber-600 text-white font-semibold rounded-lg transition duration-200">
+                            OK
+                        </button>
+                    </div>
+                </div>
+            `;
+            document.body.insertAdjacentHTML('beforeend', modalHtml);
+        }
+
+        // Initialize the camera and torch access when the page loads
+        window.onload = initCameraAndTorch;
+    </script>
+</body>
+</html>
